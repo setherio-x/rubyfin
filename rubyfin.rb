@@ -7,6 +7,7 @@ require "ostruct"
 require "net/http"
 require "json"
 
+VERSION = "0.1.1"
 CONFIG_PATH = File.join(Dir.home, ".config", "rubyfin", "config.json")
 
 def setup_config
@@ -26,30 +27,35 @@ def setup_config
   File.write(CONFIG_PATH, JSON.pretty_generate(config))
 
   config
-  
+
 end
 
 def check_connection(url)
   uri = URI("#{url}/System/Info/Public")
-  response = Net::HTTP.get_response(uri)
+  resp = Net::HTTP.get_response(uri)
 
-  if response.is_a?(Net::HTTPSuccess)
+  if resp.is_a?(Net::HTTPSuccess)
     return true
   else
     return false
   end
 end
 
-def get_libraries
-  uri = URI("#{SESSION.url}/Users/#{SESSION.uid}/Views")
-  request = Net::HTTP::Get.new(uri)
-  request["X-Emby-Authorization"] = HEADERS
+def jellyfin_get(path)
+  uri = URI("#{SESSION.url}#{path}")
+  req = Net::HTTP::Get.new(uri)
+  req["X-Emby-Authorization"] = HEADERS
 
-  response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
-    http.request(request)
+  resp = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+    http.request(req)
   end
 
-  data = JSON.parse(response.body)
+  return resp
+end
+
+def get_libraries
+  resp = jellyfin_get("/Users/#{SESSION.uid}/Views")
+  data = JSON.parse(resp.body)
   libraries = data["Items"]
 
   libraries
@@ -57,32 +63,82 @@ end
 def select_libraries
   libraries = get_libraries
   names = libraries.map { |lib| lib["Name"] }
-  choice = Gum.choose(names)
+  names.unshift("<<  Back")
+  choice = Gum.choose(names, height: 25)
+  return nil if choice == "<<  Back"
   selected = libraries.find { |lib| lib["Name"] == choice }
   selected["Id"]
 
 end
 
 def get_items(library_id)
-  uri = URI("#{SESSION.url}/Users/#{SESSION.uid}/Items?ParentId=#{library_id}&Limit=10")
-  request = Net::HTTP::Get.new(uri)
-  request["X-Emby-Authorization"] = HEADERS
-
-  response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
-    http.request(request)
-  end
-
-  data = JSON.parse(response.body)
+  resp = jellyfin_get("/Users/#{SESSION.uid}/Items?ParentId=#{library_id}")
+  data = JSON.parse(resp.body)
   items = data["Items"]
-
-  items.each do |item|
-    puts item["Name"]
-  end
 
   items
 end
 
+def get_favorites
+  resp = jellyfin_get("/Users/#{SESSION.uid}/Items?Filters=IsFavorite&Recursive=true")
+  data = JSON.parse(resp.body)
+  data["Items"]
+end
+
+def favorites
+  items = get_favorites
+
+  if items.empty?
+    puts "No favorites found."
+    return
+  end
+
+  names = items.map { |item| item["Name"] }
+  names.unshift("<<  Back")
+  choice = Gum.choose(names, height: 25)
+
+  return if choice == "<<  Back"
+
+  selected = items.find { |item| item["Name"] == choice }
+
+  if selected["Type"] == "Episode" || selected["Type"] == "Movie"
+    system("mpv", "#{SESSION.url}/Videos/#{selected['Id']}/stream?static=true&api_key=#{SESSION.token}")
+  else
+    browse(selected["Id"])
+  end
+end
+
+def search_items(qry)
+  enc = URI.encode_www_form_component(qry)
+  resp = jellyfin_get("/Users/#{SESSION.uid}/Items?searchTerm=#{enc}&Recursive=true&Limit=25")
+  data = JSON.parse(resp.body)
+  data["Items"]
+end
+
+def search
+  qry= Gum.input(placeholder: "Search...", header: "Search for a title")
+  return if qry.nil? || qry.strip.empty?
+
+  results = search_items(qry)
+
+  if results.empty?
+    puts "No results found."
+    return
+  end
+
+  names = results.map { |item| item["Name"] }
+  choice = Gum.choose(names, height: 25)
+  selected = results.find { |item| item["Name"] == choice }
+
+  if selected["Type"] == "Episode" || selected["Type"] == "Movie"
+    system("mpv", "#{SESSION.url}/Videos/#{selected['Id']}/stream?static=true&api_key=#{SESSION.token}")
+  else
+    browse(selected["Id"])
+  end
+end
+
 def browse(library_id)
+  history = []
   current_id = library_id
 
   loop do
@@ -90,15 +146,38 @@ def browse(library_id)
 
     if items.first && items.first["Type"] == "Episode"
       names = items.map { |ep| "#{ep['IndexNumber']}. #{ep['Name']}" }
-      choice = Gum.choose(names)
+      names.unshift("<<  Back")
+      choice = Gum.choose(names, height: 25)
+
+      if choice == "<<  Back"
+        if history.empty?
+          break
+        else
+          current_id = history.pop
+          next
+        end
+      end
+
       selected = items.find { |ep| "#{ep['IndexNumber']}. #{ep['Name']}" == choice }
       system("mpv", "#{SESSION.url}/Videos/#{selected['Id']}/stream?static=true&api_key=#{SESSION.token}")
-      break
+      next
     end
-    # Otherwise let user pick and go deeper
+
     names = items.map { |item| item["Name"] }
-    choice = Gum.choose(names)
+    names.unshift("<<  Back")
+    choice = Gum.choose(names, height: 25)
+
+    if choice == "<<  Back"
+      if history.empty?
+        break
+      else
+        current_id = history.pop
+        next
+      end
+    end
+
     selected = items.find { |item| item["Name"] == choice }
+    history.push(current_id)
     current_id = selected["Id"]
   end
 end
@@ -107,19 +186,19 @@ def get_user_info(config)
   url = config["url"]
   uri = URI("#{url}/Users/AuthenticateByName")
 
-  request = Net::HTTP::Post.new(uri)
-  request["Content-Type"] = "application/json"
-  request["X-Emby-Authorization"] = 'MediaBrowser Client="Rubyfin", Device="PC", DeviceId="rubyfin", Version="0.1.0"'
-  request.body = JSON.generate({
+  req = Net::HTTP::Post.new(uri)
+  req["Content-Type"] = "application/json"
+  req["X-Emby-Authorization"] = 'MediaBrowser Client="Rubyfin", Device="PC", DeviceId="rubyfin", Version="0.1.0"'
+  req.body = JSON.generate({
     "Username" => config["username"],
     "Pw" => config["password"]
   })
 
-  response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
-    http.request(request)
+  resp = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+    http.request(req)
   end
 
-  data = JSON.parse(response.body)
+  data = JSON.parse(resp.body)
   token = data["AccessToken"]
   uid = data["User"]["Id"]
 
@@ -145,20 +224,33 @@ end
 style = Lipgloss::Style.new
   .bold(true)
   .foreground("#50fa7b")
-#  .border(:rounded)
-#  .border_foreground("#874BFD")
+  .border(:rounded)
+  .border_foreground("#874BFD")
   .padding(1, 2)
-#  .width(60)
+  .width(60)
+  .height(5)
 
 user_info = get_user_info(config)
 
 # puts user_info["token"]
 # puts user_info["uid"]
 
-HEADERS = 'MediaBrowser Client="Rubyfin", Device="PC", DeviceId="rubyfin", Version="0.1.0", Token="' + user_info["token"] + '"'
+HEADERS = 'MediaBrowser Client="Rubyfin", Device="PC", DeviceId="rubyfin", Version="' + VERSION + '", Token="' + user_info["token"] + '"'
 
 # session: url, username, password, token, uid
 SESSION = OpenStruct.new(config.merge(user_info))
 
-library_id = select_libraries
-browse(library_id)
+loop do
+  action = Gum.choose(["Browse Library", "Search", "Favorites", "Quit"], height: 25)
+
+  if action == "Search"
+    search
+  elsif action == "Favorites"
+    favorites
+  elsif action == "Quit"
+    break
+  else
+    library_id = select_libraries
+    browse(library_id)
+  end
+end

@@ -10,6 +10,11 @@ Just a little CLI thing I'm messing around with for my Jellyfin server. Nothing 
 
 That's it really. Work in progress, very janky, mostly for fun.
 
+## What It Doesn't Do
+
+- A lot
+- Movies aren't working...
+
 ## Requirements
 
 - Ruby (obviously)
