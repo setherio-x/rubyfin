@@ -1,5 +1,7 @@
 # Rubyfin
 
+Inspired by [jftui](https://github.com/Aanok/jftui).
+
 Just a little CLI thing I'm messing around with for my Jellyfin server. Nothing serious, mostly just testing out some Ruby stuff and seeing if I can make a TUI that doesn't feel absolutely terrible (even thought it still does).
 
 ## What It Does (When It Works)
